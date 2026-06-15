@@ -1,0 +1,112 @@
+name: Publish destination image packs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "image_bank_full/**"
+      - "scripts/build_image_distribution.py"
+      - ".github/workflows/publish-image-distribution.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: image-bank-distribution
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: image-bank-distribution
+  BUILD_DIR: build/image_distribution
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out image bank
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and validate destination packs
+        run: |
+          python scripts/build_image_distribution.py \
+            --source image_bank_full \
+            --output "$BUILD_DIR" \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --source-commit "$GITHUB_SHA"
+
+      - name: Create distribution release when missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "Itinerary image-bank distribution" \
+              --notes "Machine-generated destination packs for the itinerary application. Do not edit release assets manually."
+          fi
+
+      - name: Publish destination packs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "$BUILD_DIR"/packs/*.zip \
+            --clobber
+
+      - name: Publish manifest last
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "$BUILD_DIR/manifest.json" \
+            --clobber
+
+      - name: Remove obsolete release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          manifest = json.loads(Path(os.environ["BUILD_DIR"]).joinpath("manifest.json").read_text(encoding="utf-8"))
+          expected = {"manifest.json"}
+          expected.update(entry["asset_name"] for entry in manifest["destinations"].values())
+
+          result = subprocess.run(
+              ["gh", "release", "view", os.environ["RELEASE_TAG"], "--json", "assets"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          assets = json.loads(result.stdout).get("assets", [])
+          for asset in assets:
+              name = asset.get("name", "")
+              if name and name not in expected:
+                  subprocess.run(
+                      ["gh", "release", "delete-asset", os.environ["RELEASE_TAG"], name, "--yes"],
+                      check=True,
+                  )
+          PY
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-bank-distribution-${{ github.sha }}
+          path: build/image_distribution/manifest.json
+          if-no-files-found: warn
+          retention-days: 14
